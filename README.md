@@ -1,8 +1,8 @@
-# RAMMapTray
+﻿# RAMMapTray
 
 A lightweight Windows system tray utility and companion for Microsoft Sysinternals RAMMap, featuring a Windows 11-style flyout and native memory optimization via the Windows NT API.
 
-![RAMMapTray Preview](view.jpg)
+![RAMMapTray Preview](assets/view.jpg)
 
 ## Features
 
