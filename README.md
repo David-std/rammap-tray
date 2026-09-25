@@ -1,70 +1,58 @@
-# RAMMap Tray Companion
+# RAMMapTray
 
-Adaptador y monitor en la bandeja del sistema (System Tray) para Windows con interfaz Fluent Design y optimización de memoria a bajo nivel.
+A lightweight Windows system tray utility and companion for Microsoft Sysinternals RAMMap, featuring a Windows 11-style flyout and native memory optimization via the Windows NT API.
 
----
+## Features
 
-## Autor
+- **Live Tray Icon:** Displays real-time RAM usage percentage directly in the notification area.
+- **Windows 11 Flyout:** Dark mode flyout showing total, used, standby, and free physical memory.
+- **Native Memory Purge:** Uses `NtSetSystemInformation` (`ntdll.dll`) with elevated privileges to flush:
+  - Standby List
+  - Working Sets (with per-process working set trimming)
+  - Modified Page List
+- **RAMMap Integration:** Detects and focuses running Sysinternals RAMMap instances, or launches `RAMMap64.exe` / `RAMMap.exe` if available.
+- **UAC-free Autostart:** Batch script configuration via Windows Task Scheduler (`schtasks`) to start on login with administrator privileges without UAC prompts.
 
-- **Morales Venegas, David Joel**
-
----
-
-## Descripción
-
-Aplicación en C# .NET y WPF que proporciona acceso rápido y visualización del estado de la memoria RAM desde el área de notificación de Windows. Incorpora integración nativa con rutinas del kernel de Windows NT y sirve como complemento interactivo para la herramienta Sysinternals RAMMap de Microsoft.
-
-### Funcionalidades:
-- **Icono Dinámico en Bandeja:** Dibuja el porcentaje de memoria en uso directamente sobre el icono del System Tray en tiempo real.
-- **Flyout con Estilo Windows 11:** Panel desplegable con diseño Fluent Dark Mode (WinUI 3) que detalla memoria total, usada, en espera (Standby) y libre.
-- **Optimización Nativa vía NT API:** Ejecuta llamadas directas a `ntdll.dll` (`NtSetSystemInformation`) con elevación de privilegios (`SeProfileSingleProcessPrivilege`, `SeIncreaseQuotaPrivilege`) para purgar:
-  - Lista de espera (Standby List).
-  - Conjuntos de trabajo de procesos de usuario (Working Sets).
-  - Lista de páginas modificadas (Modified Page List).
-- **Lanzador de Sysinternals RAMMap:** Detecta y restaura instancias en ejecución o abre el binario oficial de RAMMap si se encuentra en el entorno o rutas del sistema.
-
----
-
-## Estructura del Repositorio
+## Project Structure
 
 ```text
 rammap-tray/
 ├── src/
-│   ├── App.xaml / App.xaml.cs                 # Punto de entrada, mutex de instancia única y ciclo de vida
-│   ├── FlyoutWindow.xaml / .cs                # Ventana emergente con paleta Windows 11 Dark Mode
-│   ├── NativeMemory.cs                        # P/Invoke a kernel32 y ntdll para purga de memoria
-│   ├── TrayIconManager.cs                     # Generación dinámica del icono en GDI+ y menú contextual
-│   ├── app.manifest                           # Manifiesto de privilegios y compatibilidad DPI
-│   └── RAMMapTray.csproj                      # Configuración del proyecto .NET
+│   ├── App.xaml / App.xaml.cs                   # Application entry point and single-instance mutex
+│   ├── FlyoutWindow.xaml / FlyoutWindow.xaml.cs # Windows 11 dark mode flyout UI
+│   ├── NativeMemory.cs                          # P/Invoke definitions for kernel32 and ntdll
+│   ├── TrayIconManager.cs                       # Tray icon rendering and context menu
+│   ├── app.manifest                             # Execution level and DPI settings
+│   └── RAMMapTray.csproj                        # .NET project file
 ├── scripts/
-│   ├── ConfigStartWindows.bat                 # Crea una tarea programada para inicio con Windows sin UAC
-│   └── RunRAMMapTray.bat                      # Lanzador con elevación automática de permisos
-├── .gitignore                                 # Reglas de exclusión para .NET y binarios externos
+│   ├── ConfigStartWindows.bat                   # Registers startup task via Task Scheduler
+│   └── RunRAMMapTray.bat                        # Elevation launcher
+├── .gitignore
 └── README.md
 ```
 
----
+## Requirements & Building
 
-## Requisitos y Compilación
+- Windows 10 (1809+) or Windows 11 (x64)
+- .NET SDK (8.0, 9.0, or 10.0 preview) with Windows Desktop workload
 
-- **Sistema Operativo:** Windows 10 (1809+) o Windows 11 (x64).
-- **SDK:** .NET SDK 8.0, 9.0 o 10.0 con soporte para Windows Desktop / WPF.
+### Build
 
-### Compilación desde terminal:
 ```bash
 cd src
 dotnet build -c Release
 ```
 
-### Publicación autocontenida (Single-File):
+### Publish (Single-File Executable)
+
 ```bash
 dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
 ```
 
-El ejecutable resultante puede colocarse junto a los scripts en la carpeta `scripts/` o registrarse para iniciar con el sistema ejecutando `ConfigStartWindows.bat` como Administrador.
+The compiled binary (`RAMMapTray.exe`) will be generated under `src/bin/Release/.../publish/`.
 
----
+## Setup
 
-## Nota sobre Sysinternals RAMMap
-
-Los ejecutables oficiales `RAMMap.exe` / `RAMMap64.exe` son propiedad de Microsoft Corporation. Esta herramienta actúa como un companion/adaptador complementario y no redistribuye binarios propietarios de Microsoft. Si desea abrir la interfaz completa de RAMMap desde el menú contextual, puede descargar el ejecutable oficial desde [Microsoft Learn Sysinternals](https://learn.microsoft.com/sysinternals/downloads/rammap) y colocarlo en la misma carpeta o en el PATH del sistema.
+1. Build or publish `RAMMapTray.exe`.
+2. *(Optional)* Place `RAMMap64.exe` (from [Sysinternals](https://learn.microsoft.com/sysinternals/downloads/rammap)) in the same folder or in your system `PATH` if you want the "Open RAMMap" option to launch the official GUI.
+3. Run `scripts/ConfigStartWindows.bat` as Administrator to enable start on Windows logon without UAC prompts.
