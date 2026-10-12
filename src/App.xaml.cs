@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -19,6 +19,32 @@ namespace RAMMapTray
         [DllImport("user32.dll")]
         private static extern bool IsIconic(IntPtr hWnd);
 
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern unsafe int GetWindowTextW(IntPtr hWnd, char* lpString, int nMaxCount);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint processAccess, bool bInheritHandle, uint processId);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern unsafe bool QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, char* lpExeName, ref uint lpdwSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
         private const int SW_RESTORE = 9;
         private const int SW_SHOW = 5;
 
@@ -54,6 +80,12 @@ namespace RAMMapTray
 
             base.OnStartup(e);
 
+            try
+            {
+                System.Windows.Media.RenderOptions.ProcessRenderMode = System.Windows.Interop.RenderMode.Default;
+            }
+            catch { }
+
             _flyoutWindow = new FlyoutWindow(LaunchRAMMapExecutable);
 
             // Pre-initialize native window handle so the first click shows instantly without cold-start delay
@@ -83,6 +115,9 @@ namespace RAMMapTray
             RefreshMemoryNow();
         }
 
+        private bool _isRefreshing = false;
+        private DateTime _lastToggleTime = DateTime.MinValue;
+
         private void Timer_Tick(object? sender, EventArgs e)
         {
             RefreshMemoryNow();
@@ -90,9 +125,17 @@ namespace RAMMapTray
 
         public void RefreshMemoryNow()
         {
+            _ = RefreshMemoryAsync();
+        }
+
+        public async Task RefreshMemoryAsync()
+        {
+            if (_isRefreshing) return;
+            _isRefreshing = true;
+
             try
             {
-                MemoryStatusInfo memInfo = NativeMemory.GetMemoryStatus();
+                MemoryStatusInfo memInfo = await Task.Run(() => NativeMemory.GetMemoryStatus());
                 int pct = (int)Math.Round(memInfo.MemoryLoadPercentage);
                 double usedGB = memInfo.UsedMemoryBytes / (1024.0 * 1024 * 1024);
                 double totalGB = memInfo.TotalMemoryBytes / (1024.0 * 1024 * 1024);
@@ -108,11 +151,22 @@ namespace RAMMapTray
             catch
             {
             }
+            finally
+            {
+                _isRefreshing = false;
+            }
         }
 
         private void ToggleFlyoutWindow()
         {
             if (_flyoutWindow == null) return;
+
+            if ((DateTime.UtcNow - _lastToggleTime).TotalMilliseconds < 250 ||
+                (DateTime.UtcNow - _flyoutWindow.LastHideTime).TotalMilliseconds < 250)
+            {
+                return;
+            }
+            _lastToggleTime = DateTime.UtcNow;
 
             if (_flyoutWindow.IsVisible)
             {
@@ -120,70 +174,133 @@ namespace RAMMapTray
             }
             else
             {
-                RefreshMemoryNow();
                 _flyoutWindow.PositionNearTray();
                 _flyoutWindow.Show();
-                _flyoutWindow.PositionNearTray();
                 _flyoutWindow.Activate();
+                try
+                {
+                    var helper = new System.Windows.Interop.WindowInteropHelper(_flyoutWindow);
+                    if (helper.Handle != IntPtr.Zero)
+                    {
+                        SetForegroundWindow(helper.Handle);
+                    }
+                }
+                catch { }
+                _flyoutWindow.PositionNearTray();
                 _flyoutWindow.RecordShowTime();
+                RefreshMemoryNow();
             }
         }
 
         private void PurgeAllMemory()
         {
-            NativeMemory.PurgeAll();
-            RefreshMemoryNow();
+            Task.Run(() =>
+            {
+                NativeMemory.PurgeAll();
+                Dispatcher.Invoke(RefreshMemoryNow);
+            });
         }
 
         private void PurgeWorkingSetsMemory()
         {
-            NativeMemory.EmptyWorkingSets();
-            RefreshMemoryNow();
+            Task.Run(() =>
+            {
+                NativeMemory.EmptyWorkingSets();
+                Dispatcher.Invoke(RefreshMemoryNow);
+            });
         }
 
         private void PurgeStandbyMemory()
         {
-            NativeMemory.EmptyStandbyList();
-            RefreshMemoryNow();
+            Task.Run(() =>
+            {
+                NativeMemory.EmptyStandbyList();
+                Dispatcher.Invoke(RefreshMemoryNow);
+            });
+        }
+
+        private unsafe bool TryActivateRunningRAMMap()
+        {
+            IntPtr targetHwnd = IntPtr.Zero;
+
+            EnumWindows((hWnd, lParam) =>
+            {
+                if (!IsWindowVisible(hWnd) && !IsIconic(hWnd))
+                    return true;
+
+                char* titleBuf = stackalloc char[256];
+                int len = GetWindowTextW(hWnd, titleBuf, 256);
+                if (len > 0)
+                {
+                    ReadOnlySpan<char> title = new ReadOnlySpan<char>(titleBuf, len);
+                    if (title.StartsWith("RAMMap", StringComparison.OrdinalIgnoreCase) &&
+                        !title.Contains("Companion", StringComparison.OrdinalIgnoreCase))
+                    {
+                        targetHwnd = hWnd;
+                        return false;
+                    }
+                }
+
+                GetWindowThreadProcessId(hWnd, out uint pid);
+                if (pid != 0)
+                {
+                    IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                    if (hProc != IntPtr.Zero)
+                    {
+                        try
+                        {
+                            char* nameBuf = stackalloc char[260];
+                            uint size = 260;
+                            if (QueryFullProcessImageNameW(hProc, 0, nameBuf, ref size) && size > 0)
+                            {
+                                ReadOnlySpan<char> fullPath = new ReadOnlySpan<char>(nameBuf, (int)size);
+                                int lastSlash = fullPath.LastIndexOf('\\');
+                                ReadOnlySpan<char> exeName = lastSlash >= 0 ? fullPath.Slice(lastSlash + 1) : fullPath;
+                                if (exeName.StartsWith("RAMMap", StringComparison.OrdinalIgnoreCase) &&
+                                    !exeName.Equals("RAMMapTray.exe", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    targetHwnd = hWnd;
+                                    return false;
+                                }
+                            }
+                        }
+                        finally
+                        {
+                            CloseHandle(hProc);
+                        }
+                    }
+                }
+
+                return true;
+            }, IntPtr.Zero);
+
+            if (targetHwnd != IntPtr.Zero)
+            {
+                if (IsIconic(targetHwnd))
+                    ShowWindowAsync(targetHwnd, SW_RESTORE);
+                else
+                    ShowWindowAsync(targetHwnd, SW_SHOW);
+                SetForegroundWindow(targetHwnd);
+                return true;
+            }
+
+            return false;
         }
 
         private void LaunchRAMMapExecutable()
         {
             try
             {
-                // First check if an existing RAMMap instance is already running; if so, restore and focus it
-                foreach (var proc in Process.GetProcesses())
+                if (TryActivateRunningRAMMap())
                 {
-                    try
-                    {
-                        if (proc.ProcessName.StartsWith("RAMMap", StringComparison.OrdinalIgnoreCase) &&
-                            !proc.ProcessName.Equals("RAMMapTray", StringComparison.OrdinalIgnoreCase))
-                        {
-                            IntPtr hWnd = proc.MainWindowHandle;
-                            if (hWnd != IntPtr.Zero)
-                            {
-                                if (IsIconic(hWnd))
-                                    ShowWindowAsync(hWnd, SW_RESTORE);
-                                else
-                                    ShowWindowAsync(hWnd, SW_SHOW);
-                                SetForegroundWindow(hWnd);
-                                return;
-                            }
-                        }
-                    }
-                    catch { }
-                    finally { proc.Dispose(); }
+                    return;
                 }
 
-                // If not running, launch executable
                 string[] candidateDirs = new[]
                 {
                     AppDomain.CurrentDomain.BaseDirectory,
                     Directory.GetCurrentDirectory(),
-                                        Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tools"),
-                    Directory.GetParent(AppDomain.CurrentDomain.BaseDirectory)?.FullName ?? "",
-                    Directory.GetParent(AppDomain.CurrentDomain.BaseDirectory)?.Parent?.FullName ?? "",
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Sysinternals"),
+                    @"c:\Users\david\Documents\RAMMap",
                     Path.GetDirectoryName(AppDomain.CurrentDomain.BaseDirectory) ?? ""
                 };
 

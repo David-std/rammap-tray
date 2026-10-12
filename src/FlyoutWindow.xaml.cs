@@ -25,10 +25,84 @@ namespace RAMMapTray
         [DllImport("user32.dll")]
         private static extern bool SetForegroundWindow(IntPtr hWnd);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll")]
+        private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint processAccess, bool bInheritHandle, uint processId);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern unsafe bool QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, char* lpExeName, ref uint lpdwSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MSLLHOOKSTRUCT
+        {
+            public POINT pt;
+            public uint mouseData;
+            public uint flags;
+            public uint time;
+            public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct RECT
+        {
+            public int Left;
+            public int Top;
+            public int Right;
+            public int Bottom;
+        }
+
+        private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string? lpModuleName);
+
+        private const int WH_MOUSE_LL = 14;
+        private const int WM_LBUTTONDOWN = 0x0201;
+        private const int WM_RBUTTONDOWN = 0x0204;
+        private const int WM_MBUTTONDOWN = 0x0207;
+        private const int WM_NCLBUTTONDOWN = 0x00A1;
+        private const int WM_NCRBUTTONDOWN = 0x00A4;
+
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        private const int GWL_EXSTYLE = -20;
+        private const int WS_EX_TOOLWINDOW = 0x00000080;
+
         private const int WM_KEYDOWN = 0x0100;
         private const int WM_KEYUP = 0x0101;
         private const int WM_SYSKEYDOWN = 0x0104;
         private const int WM_SYSKEYUP = 0x0105;
+        private const int WM_ACTIVATE = 0x0006;
+        private const int WA_INACTIVE = 0;
         private const int VK_SNAPSHOT = 0x2C;
 
         private readonly Action _onRAMMapLaunchRequest;
@@ -41,10 +115,30 @@ namespace RAMMapTray
         private System.Windows.Threading.DispatcherTimer? _inactivityTimer;
         private DateTime _lastShowTime = DateTime.MinValue;
 
+        public DateTime LastHideTime { get; private set; } = DateTime.MinValue;
+
+        private IntPtr _mouseHookHandle = IntPtr.Zero;
+        private LowLevelMouseProc? _mouseHookDelegate;
+
+        private ulong _lastUsedBytes = ulong.MaxValue;
+        private ulong _lastStandbyBytes = ulong.MaxValue;
+        private ulong _lastFreeBytes = ulong.MaxValue;
+        private MediaBrush? _cachedAccentBrush;
+
+        private static readonly string[] DotFrames = { ".", "..", "..." };
+        private static readonly System.Windows.Media.FontFamily FluentFont = new System.Windows.Media.FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets");
+
         public FlyoutWindow(Action onRAMMapLaunchRequest)
         {
             InitializeComponent();
             _onRAMMapLaunchRequest = onRAMMapLaunchRequest;
+            IsVisibleChanged += (s, e) =>
+            {
+                if (!(bool)e.NewValue)
+                {
+                    UninstallMouseHook();
+                }
+            };
         }
 
         protected override void OnSourceInitialized(EventArgs e)
@@ -53,7 +147,16 @@ namespace RAMMapTray
             if (PresentationSource.FromVisual(this) is HwndSource source)
             {
                 source.AddHook(WndProc);
+
+                // Prevent the window from ever appearing in the Windows Taskbar or Alt+Tab
+                try
+                {
+                    int exStyle = GetWindowLong(source.Handle, GWL_EXSTYLE);
+                    SetWindowLong(source.Handle, GWL_EXSTYLE, exStyle | WS_EX_TOOLWINDOW);
+                }
+                catch { }
             }
+            PositionNearTray();
         }
 
         private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -67,24 +170,39 @@ namespace RAMMapTray
                     TriggerModernScreenClip();
                 }
             }
+            else if (msg == WM_ACTIVATE)
+            {
+                int state = wParam.ToInt32() & 0xFFFF;
+                if (state == WA_INACTIVE)
+                {
+                    HandleDeactivation();
+                }
+            }
             return IntPtr.Zero;
         }
 
         public void PositionNearTray()
         {
-            this.UpdateLayout();
-
-            if (this.ActualWidth == 0 || this.ActualHeight == 0)
+            if (this.ActualHeight <= 0)
             {
                 this.Measure(new System.Windows.Size(this.Width > 0 ? this.Width : 332, double.PositiveInfinity));
             }
 
-            double w = this.ActualWidth > 0 ? this.ActualWidth : (this.DesiredSize.Width > 0 ? this.DesiredSize.Width : 332);
-            double h = this.ActualHeight > 0 ? this.ActualHeight : (this.DesiredSize.Height > 0 ? this.DesiredSize.Height : 248);
+            double w = this.ActualWidth > 0 ? this.ActualWidth : (this.Width > 0 ? this.Width : 332);
+            double h = this.ActualHeight > 0 ? this.ActualHeight : (this.DesiredSize.Height > 0 ? this.DesiredSize.Height : 295);
 
             var workingArea = SystemParameters.WorkArea;
             this.Left = workingArea.Right - w - 12;
             this.Top = workingArea.Bottom - h - 12;
+        }
+
+        protected override void OnRenderSizeChanged(SizeChangedInfo sizeInfo)
+        {
+            base.OnRenderSizeChanged(sizeInfo);
+            if (sizeInfo.HeightChanged)
+            {
+                PositionNearTray();
+            }
         }
 
         public void RecordShowTime()
@@ -92,7 +210,85 @@ namespace RAMMapTray
             _lastShowTime = DateTime.UtcNow;
             _isScreenClippingActive = false;
             this.Topmost = true;
+            InstallMouseHook();
             StartInactivityTimer();
+        }
+
+        private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0 && this.IsVisible)
+            {
+                int msg = wParam.ToInt32();
+                if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN ||
+                    msg == WM_NCLBUTTONDOWN || msg == WM_NCRBUTTONDOWN)
+                {
+                    unsafe
+                    {
+                        MSLLHOOKSTRUCT* hookStruct = (MSLLHOOKSTRUCT*)lParam;
+                        int x = hookStruct->pt.X;
+                        int y = hookStruct->pt.Y;
+
+                        IntPtr hWnd = new WindowInteropHelper(this).Handle;
+                        if (hWnd != IntPtr.Zero && GetWindowRect(hWnd, out RECT rc))
+                        {
+                            if (x < rc.Left || x > rc.Right || y < rc.Top || y > rc.Bottom)
+                            {
+                                if (!_isScreenClippingActive)
+                                {
+                                    if (Dispatcher.CheckAccess())
+                                    {
+                                        HandleDeactivation();
+                                    }
+                                    else
+                                    {
+                                        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Send, new Action(HandleDeactivation));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return CallNextHookEx(_mouseHookHandle, nCode, wParam, lParam);
+        }
+
+        private void InstallMouseHook()
+        {
+            if (_mouseHookHandle != IntPtr.Zero) return;
+            try
+            {
+                _mouseHookDelegate = MouseHookCallback;
+                IntPtr hMod = IntPtr.Zero;
+                using (var curProc = Process.GetCurrentProcess())
+                using (var curMod = curProc.MainModule)
+                {
+                    if (curMod != null)
+                    {
+                        hMod = GetModuleHandle(curMod.ModuleName);
+                    }
+                }
+                _mouseHookHandle = SetWindowsHookEx(WH_MOUSE_LL, _mouseHookDelegate, hMod, 0);
+            }
+            catch { }
+        }
+
+        private void UninstallMouseHook()
+        {
+            if (_mouseHookHandle != IntPtr.Zero)
+            {
+                try
+                {
+                    UnhookWindowsHookEx(_mouseHookHandle);
+                }
+                catch { }
+                _mouseHookHandle = IntPtr.Zero;
+            }
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            UninstallMouseHook();
+            base.OnClosed(e);
         }
 
         public void StartInactivityTimer()
@@ -258,6 +454,16 @@ namespace RAMMapTray
 
         public void UpdateMetrics(MemoryStatusInfo memInfo)
         {
+            if (memInfo.UsedMemoryBytes == _lastUsedBytes &&
+                memInfo.StandbyMemoryBytes == _lastStandbyBytes &&
+                memInfo.FreeMemoryBytes == _lastFreeBytes)
+            {
+                return;
+            }
+            _lastUsedBytes = memInfo.UsedMemoryBytes;
+            _lastStandbyBytes = memInfo.StandbyMemoryBytes;
+            _lastFreeBytes = memInfo.FreeMemoryBytes;
+
             int percent = (int)Math.Round(memInfo.MemoryLoadPercentage);
             TxtPercentage.Text = percent.ToString();
 
@@ -277,7 +483,8 @@ namespace RAMMapTray
             if (trackWidth <= 0) trackWidth = 280;
             ProgressFill.Width = trackWidth * (clampedPercent / 100.0);
 
-            ProgressFill.Background = (MediaBrush)FindResource("AccentDefault");
+            _cachedAccentBrush ??= (MediaBrush)FindResource("AccentDefault");
+            ProgressFill.Background = _cachedAccentBrush;
         }
 
         private void Close_Click(object sender, RoutedEventArgs e)
@@ -285,59 +492,65 @@ namespace RAMMapTray
             _clipWatchTimer?.Stop();
             _inactivityTimer?.Stop();
             ResetRAMMapButton();
+            UninstallMouseHook();
+            LastHideTime = DateTime.UtcNow;
             this.Hide();
         }
 
-        private bool IsSnippingToolActive()
+        private unsafe bool IsSnippingToolActive()
         {
             try
             {
                 IntPtr fgHwnd = GetForegroundWindow();
-                if (fgHwnd != IntPtr.Zero)
+                if (fgHwnd == IntPtr.Zero) return false;
+
+                GetWindowThreadProcessId(fgHwnd, out uint pid);
+                if (pid == 0) return false;
+
+                IntPtr hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+                if (hProc == IntPtr.Zero) return false;
+
+                try
                 {
-                    GetWindowThreadProcessId(fgHwnd, out uint pid);
-                    if (pid != 0)
+                    char* buf = stackalloc char[260];
+                    uint size = 260;
+                    if (QueryFullProcessImageNameW(hProc, 0, buf, ref size) && size > 0)
                     {
-                        using var proc = Process.GetProcessById((int)pid);
-                        string name = proc.ProcessName;
-                        if (name.Contains("ScreenClipping", StringComparison.OrdinalIgnoreCase) ||
-                            name.Contains("SnippingTool", StringComparison.OrdinalIgnoreCase) ||
-                            name.Contains("ScreenClip", StringComparison.OrdinalIgnoreCase) ||
-                            name.Contains("ShellExperienceHost", StringComparison.OrdinalIgnoreCase))
-                        {
-                            return true;
-                        }
+                        ReadOnlySpan<char> span = new ReadOnlySpan<char>(buf, (int)size);
+                        return span.Contains("ScreenClipping", StringComparison.OrdinalIgnoreCase) ||
+                               span.Contains("SnippingTool", StringComparison.OrdinalIgnoreCase) ||
+                               span.Contains("ScreenClip", StringComparison.OrdinalIgnoreCase);
                     }
                 }
-
-                if (Process.GetProcessesByName("ScreenClippingHost").Length > 0)
+                finally
                 {
-                    return true;
+                    CloseHandle(hProc);
                 }
             }
             catch { }
             return false;
         }
 
+        private void HandleDeactivation()
+        {
+            if (_isScreenClippingActive)
+            {
+                if (IsSnippingToolActive())
+                {
+                    return;
+                }
+            }
+
+            LastHideTime = DateTime.UtcNow;
+            _inactivityTimer?.Stop();
+            ResetRAMMapButton();
+            UninstallMouseHook();
+            this.Hide();
+        }
+
         private void Window_Deactivated(object sender, EventArgs e)
         {
-            if ((DateTime.UtcNow - _lastShowTime).TotalMilliseconds < 350)
-            {
-                return;
-            }
-
-            // Don't close if Snipping Tool is capturing or active
-            if (_isScreenClippingActive || IsSnippingToolActive())
-            {
-                return;
-            }
-
-            if (!this.IsMouseOver && !_isBusy)
-            {
-                _inactivityTimer?.Stop();
-                ResetRAMMapButton();
-                this.Hide();
-            }
+            HandleDeactivation();
         }
 
         private async Task RunWithDotsAnimationAsync(System.Windows.Controls.Button button, string baseText, string originalText, Func<Task> action)
@@ -354,7 +567,7 @@ namespace RAMMapTray
             dotsTimer.Tick += (s, args) =>
             {
                 dotStep = (dotStep % 3) + 1;
-                button.Content = baseText + new string('.', dotStep);
+                button.Content = baseText + DotFrames[dotStep - 1];
             };
             button.Content = baseText + ".";
             dotsTimer.Start();
@@ -401,7 +614,7 @@ namespace RAMMapTray
             var icon = new TextBlock
             {
                 Text = "\uE73E",
-                FontFamily = new System.Windows.Media.FontFamily("Segoe Fluent Icons, Segoe MDL2 Assets"),
+                FontFamily = FluentFont,
                 FontSize = Math.Max(9.0, fontSize - 1.0),
                 VerticalAlignment = System.Windows.VerticalAlignment.Center
             };
@@ -449,7 +662,7 @@ namespace RAMMapTray
                 return;
             }
 
-            // Confirmed second click: animate dots "Abriendo...", launch/focus, show "Listo ✓", revert to "RAMMap"
+            // Confirmed launch
             _ramMapConfirmTimer?.Stop();
             _isRamMapConfirming = false;
 

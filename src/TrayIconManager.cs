@@ -82,10 +82,16 @@ namespace RAMMapTray
                 Text = "RAM"
             };
 
+            DateTime lastClickTime = DateTime.MinValue;
             _notifyIcon.MouseClick += (s, e) =>
             {
                 if (e.Button == MouseButtons.Left)
                 {
+                    if ((DateTime.UtcNow - lastClickTime).TotalMilliseconds < 250)
+                    {
+                        return;
+                    }
+                    lastClickTime = DateTime.UtcNow;
                     _onToggleFlyout?.Invoke();
                 }
             };
@@ -93,6 +99,8 @@ namespace RAMMapTray
             UpdateIcon(50, "RAM: 50%");
             _notifyIcon.Visible = true;
         }
+
+        private static readonly Icon?[] _iconCache = new Icon?[101];
 
         public void UpdateIcon(int ramPercentage, string tooltipText)
         {
@@ -107,24 +115,30 @@ namespace RAMMapTray
                 }
 
                 _lastPercentage = ramPercentage;
+                int clamped = Math.Max(0, Math.Min(100, ramPercentage));
 
-                using (Bitmap bmp = CreateWaterGlassIcon(ramPercentage))
+                Icon? cached = _iconCache[clamped];
+                if (cached == null)
                 {
-                    IntPtr hIcon = bmp.GetHicon();
-                    try
+                    using (Bitmap bmp = CreateWaterGlassIcon(clamped))
                     {
-                        using (Icon tempIcon = Icon.FromHandle(hIcon))
+                        IntPtr hIcon = bmp.GetHicon();
+                        try
                         {
-                            Icon? oldIcon = _notifyIcon.Icon;
-                            _notifyIcon.Icon = (Icon)tempIcon.Clone();
-                            oldIcon?.Dispose();
+                            using (Icon tempIcon = Icon.FromHandle(hIcon))
+                            {
+                                cached = (Icon)tempIcon.Clone();
+                                _iconCache[clamped] = cached;
+                            }
+                        }
+                        finally
+                        {
+                            DestroyIcon(hIcon);
                         }
                     }
-                    finally
-                    {
-                        DestroyIcon(hIcon);
-                    }
                 }
+
+                _notifyIcon.Icon = cached;
             }
             catch
             {
@@ -228,24 +242,23 @@ namespace RAMMapTray
         {
             try
             {
-                using var p = new System.Diagnostics.Process();
-                p.StartInfo = new System.Diagnostics.ProcessStartInfo
+                using (RegistryKey? key = Registry.LocalMachine.OpenSubKey($@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache\Tree\{TASK_NAME}"))
                 {
-                    FileName = "schtasks.exe",
-                    Arguments = $"/Query /TN \"{TASK_NAME}\"",
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true
-                };
-                p.Start();
-                p.WaitForExit(1500);
-                return p.ExitCode == 0;
+                    if (key != null) return true;
+                }
             }
-            catch
+            catch { }
+
+            try
             {
-                return false;
+                using (RegistryKey? key = Registry.CurrentUser.OpenSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"))
+                {
+                    if (key?.GetValue(REG_APP_NAME) != null) return true;
+                }
             }
+            catch { }
+
+            return false;
         }
 
         private void UpdateAutoStartIcon()
@@ -347,6 +360,11 @@ namespace RAMMapTray
                 _notifyIcon.Icon?.Dispose();
                 _notifyIcon.Dispose();
                 _contextMenu?.Dispose();
+                for (int i = 0; i < _iconCache.Length; i++)
+                {
+                    _iconCache[i]?.Dispose();
+                    _iconCache[i] = null;
+                }
             }
             catch
             {

@@ -10,6 +10,7 @@
     <AssemblyName>RAMMapTray</AssemblyName>
     <RootNamespace>RAMMapTray</RootNamespace>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
 </Project>

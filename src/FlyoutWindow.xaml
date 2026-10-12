@@ -1,10 +1,12 @@
 <Window x:Class="RAMMapTray.FlyoutWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Memoria" Width="332" SizeToContent="Height"
+        Title="Memoria" Width="332" SizeToContent="Height" WindowStartupLocation="Manual"
         WindowStyle="None" AllowsTransparency="True" Background="Transparent"
         ShowInTaskbar="False" Topmost="True" Deactivated="Window_Deactivated"
         MouseMove="Window_UserInteraction" PreviewMouseDown="Window_UserInteraction" PreviewKeyDown="Window_PreviewKeyDown" PreviewKeyUp="Window_PreviewKeyUp"
+        TextOptions.TextFormattingMode="Display" TextOptions.TextRenderingMode="ClearType"
+        SnapsToDevicePixels="True" UseLayoutRounding="True" RenderOptions.ClearTypeHint="Enabled"
         FontFamily="Segoe UI Variable Text, Segoe UI">
 
     <Window.Resources>
@@ -121,11 +123,15 @@
         </Style>
     </Window.Resources>
 
-    <!-- Window Chrome -->
-    <Border Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource StrokeBrush}" BorderThickness="1" CornerRadius="8" Margin="8">
-        <Border.Effect>
-            <DropShadowEffect BlurRadius="20" Color="#000000" Direction="270" Opacity="0.5" ShadowDepth="3"/>
-        </Border.Effect>
+    <Grid Margin="8">
+        <Border Background="{StaticResource SurfaceBrush}" BorderBrush="{StaticResource StrokeBrush}" BorderThickness="1" CornerRadius="8">
+            <Border.Effect>
+                <DropShadowEffect BlurRadius="20" Color="#000000" Direction="270" Opacity="0.5" ShadowDepth="3" RenderingBias="Performance"/>
+            </Border.Effect>
+            <Border.CacheMode>
+                <BitmapCache RenderAtScale="1" SnapsToDevicePixels="True"/>
+            </Border.CacheMode>
+        </Border>
 
         <StackPanel Margin="0">
             <!-- Title Bar -->
@@ -199,5 +205,5 @@
                 <Button x:Name="BtnRAMMap" Content="RAMMap" Height="26" Style="{StaticResource SubtleButton}" Click="OpenRAMMap_Click" Margin="3,0,0,0"/>
             </UniformGrid>
         </StackPanel>
-    </Border>
+    </Grid>
 </Window>

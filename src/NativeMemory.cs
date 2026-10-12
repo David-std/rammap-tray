@@ -1,9 +1,7 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
-using System.Threading.Tasks;
 
 namespace RAMMapTray
 {
@@ -17,7 +15,7 @@ namespace RAMMapTray
         public ulong FreeMemoryBytes;
     }
 
-    public static class NativeMemory
+    public static unsafe class NativeMemory
     {
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Auto)]
         private struct MEMORYSTATUSEX
@@ -31,31 +29,7 @@ namespace RAMMapTray
             public ulong ullTotalVirtual;
             public ulong ullAvailVirtual;
             public ulong ullAvailExtendedVirtual;
-
-            public MEMORYSTATUSEX()
-            {
-                dwLength = (uint)Marshal.SizeOf(typeof(MEMORYSTATUSEX));
-            }
         }
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool GlobalMemoryStatusEx([In, Out] ref MEMORYSTATUSEX lpBuffer);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr OpenProcess(uint processAccess, bool bInheritHandle, int processId);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool CloseHandle(IntPtr hObject);
-
-        [DllImport("ntdll.dll", SetLastError = true)]
-        private static extern int NtSetSystemInformation(int SystemInformationClass, ref int SystemInformation, int SystemInformationLength);
-
-        [DllImport("ntdll.dll", SetLastError = true)]
-        private static extern int NtQuerySystemInformation(int SystemInformationClass, IntPtr SystemInformation, int SystemInformationLength, out int returnLength);
 
         [StructLayout(LayoutKind.Sequential)]
         private struct SYSTEM_MEMORY_LIST_INFORMATION
@@ -65,18 +39,8 @@ namespace RAMMapTray
             public ulong ModifiedPageCount;
             public ulong ModifiedNoWritePageCount;
             public ulong BadPageCount;
-            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 8)]
-            public ulong[] StandbyPageCount;
+            public fixed ulong StandbyPageCount[8];
         }
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        private static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
-
-        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-        private static extern bool LookupPrivilegeValue(string? lpSystemName, string lpName, out LUID lpLuid);
-
-        [DllImport("advapi32.dll", SetLastError = true)]
-        private static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, int BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
 
         [StructLayout(LayoutKind.Sequential)]
         private struct LUID
@@ -93,6 +57,40 @@ namespace RAMMapTray
             public uint Attributes;
         }
 
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint processAccess, bool bInheritHandle, int processId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool K32EnumProcesses(uint* pProcessIds, uint cb, out uint pBytesReturned);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern uint QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, char* lpExeName, ref uint lpdwSize);
+
+        [DllImport("ntdll.dll", SetLastError = true)]
+        private static extern int NtSetSystemInformation(int SystemInformationClass, void* SystemInformation, int SystemInformationLength);
+
+        [DllImport("ntdll.dll", SetLastError = true)]
+        private static extern int NtQuerySystemInformation(int SystemInformationClass, void* SystemInformation, int SystemInformationLength, out int returnLength);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+        private static extern bool LookupPrivilegeValue(string? lpSystemName, string lpName, out LUID lpLuid);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, int BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+
         private const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
         private const uint TOKEN_QUERY = 0x0008;
         private const uint SE_PRIVILEGE_ENABLED = 0x0002;
@@ -105,15 +103,10 @@ namespace RAMMapTray
         private const int MemoryPurgeStandbyList = 4;
         private const int MemoryPurgeLowPriorityStandbyList = 8;
 
-        private const uint PROCESS_QUERY_INFORMATION = 0x0400;
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
         private const uint PROCESS_SET_QUOTA = 0x0100;
 
-        private static readonly HashSet<string> ExcludedProcesses = new(StringComparer.OrdinalIgnoreCase)
-        {
-            "system", "idle", "dwm", "csrss", "lsass", "services", "smss", 
-            "winlogon", "explorer", "audiodg", "svchost", "rammaptray",
-            "nvvsvc", "amdrsserv", "taskhostw", "sihost"
-        };
+        private static bool _privilegesAcquired = false;
 
         public static bool IsAdministrator()
         {
@@ -124,10 +117,50 @@ namespace RAMMapTray
             }
         }
 
+        public static void EnsurePrivileges()
+        {
+            if (_privilegesAcquired) return;
+            EnablePrivilege(SE_PROFILE_SINGLE_PROCESS_NAME);
+            EnablePrivilege(SE_INCREASE_QUOTA_NAME);
+            _privilegesAcquired = true;
+        }
+
+        private static bool EnablePrivilege(string privilegeName)
+        {
+            try
+            {
+                if (!OpenProcessToken(Process.GetCurrentProcess().Handle, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out IntPtr hToken))
+                    return false;
+
+                try
+                {
+                    if (!LookupPrivilegeValue(null, privilegeName, out LUID luid))
+                        return false;
+
+                    TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES
+                    {
+                        PrivilegeCount = 1,
+                        Luid = luid,
+                        Attributes = SE_PRIVILEGE_ENABLED
+                    };
+
+                    return AdjustTokenPrivileges(hToken, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+                }
+                finally
+                {
+                    CloseHandle(hToken);
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         public static MemoryStatusInfo GetMemoryStatus()
         {
-            MemoryStatusInfo info = new MemoryStatusInfo();
-            MEMORYSTATUSEX memStatus = new MEMORYSTATUSEX();
+            MemoryStatusInfo info = default;
+            MEMORYSTATUSEX memStatus = new MEMORYSTATUSEX { dwLength = (uint)sizeof(MEMORYSTATUSEX) };
 
             if (GlobalMemoryStatusEx(ref memStatus))
             {
@@ -137,35 +170,15 @@ namespace RAMMapTray
                 info.MemoryLoadPercentage = memStatus.dwMemoryLoad;
             }
 
-            try
+            SYSTEM_MEMORY_LIST_INFORMATION sysMem;
+            if (NtQuerySystemInformation(SystemMemoryListInformation, &sysMem, sizeof(SYSTEM_MEMORY_LIST_INFORMATION), out _) == 0)
             {
-                int structSize = Marshal.SizeOf(typeof(SYSTEM_MEMORY_LIST_INFORMATION));
-                IntPtr pMem = Marshal.AllocHGlobal(structSize);
-                try
+                ulong standbyPages = 0;
+                for (int i = 0; i < 8; i++)
                 {
-                    int status = NtQuerySystemInformation(SystemMemoryListInformation, pMem, structSize, out _);
-                    if (status == 0)
-                    {
-                        SYSTEM_MEMORY_LIST_INFORMATION sysMem = Marshal.PtrToStructure<SYSTEM_MEMORY_LIST_INFORMATION>(pMem);
-                        ulong standbyPages = 0;
-                        if (sysMem.StandbyPageCount != null)
-                        {
-                            foreach (var count in sysMem.StandbyPageCount)
-                            {
-                                standbyPages += count;
-                            }
-                        }
-                        info.StandbyMemoryBytes = standbyPages * 4096;
-                    }
+                    standbyPages += sysMem.StandbyPageCount[i];
                 }
-                finally
-                {
-                    Marshal.FreeHGlobal(pMem);
-                }
-            }
-            catch
-            {
-                info.StandbyMemoryBytes = 0;
+                info.StandbyMemoryBytes = standbyPages * 4096;
             }
 
             if (info.AvailableMemoryBytes >= info.StandbyMemoryBytes)
@@ -180,70 +193,43 @@ namespace RAMMapTray
             return info;
         }
 
-        public static bool EnablePrivilege(string privilegeName)
-        {
-            try
-            {
-                IntPtr hToken;
-                if (!OpenProcessToken(Process.GetCurrentProcess().Handle, TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, out hToken))
-                    return false;
-
-                LUID luid;
-                if (!LookupPrivilegeValue(null, privilegeName, out luid))
-                    return false;
-
-                TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES
-                {
-                    PrivilegeCount = 1,
-                    Luid = luid,
-                    Attributes = SE_PRIVILEGE_ENABLED
-                };
-
-                return AdjustTokenPrivileges(hToken, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
         public static void EmptyWorkingSets()
         {
-            EnablePrivilege(SE_PROFILE_SINGLE_PROCESS_NAME);
-            EnablePrivilege(SE_INCREASE_QUOTA_NAME);
+            EnsurePrivileges();
 
             int cmd = MemoryEmptyWorkingSets;
-            NtSetSystemInformation(SystemMemoryListInformation, ref cmd, sizeof(int));
+            NtSetSystemInformation(SystemMemoryListInformation, &cmd, sizeof(int));
 
             TrimUserProcessesWorkingSets();
         }
 
         public static void EmptyStandbyList()
         {
-            EnablePrivilege(SE_PROFILE_SINGLE_PROCESS_NAME);
+            EnsurePrivileges();
 
             int command = MemoryPurgeStandbyList;
-            NtSetSystemInformation(SystemMemoryListInformation, ref command, sizeof(int));
-            
+            NtSetSystemInformation(SystemMemoryListInformation, &command, sizeof(int));
+
             int cmdLow = MemoryPurgeLowPriorityStandbyList;
-            NtSetSystemInformation(SystemMemoryListInformation, ref cmdLow, sizeof(int));
+            NtSetSystemInformation(SystemMemoryListInformation, &cmdLow, sizeof(int));
         }
 
         public static void PurgeAll()
         {
-            EnablePrivilege(SE_PROFILE_SINGLE_PROCESS_NAME);
-            EnablePrivilege(SE_INCREASE_QUOTA_NAME);
+            EnsurePrivileges();
 
             int cmdSb = MemoryPurgeStandbyList;
-            NtSetSystemInformation(SystemMemoryListInformation, ref cmdSb, sizeof(int));
+            NtSetSystemInformation(SystemMemoryListInformation, &cmdSb, sizeof(int));
+
             int cmdSbLow = MemoryPurgeLowPriorityStandbyList;
-            NtSetSystemInformation(SystemMemoryListInformation, ref cmdSbLow, sizeof(int));
+            NtSetSystemInformation(SystemMemoryListInformation, &cmdSbLow, sizeof(int));
 
             int cmdMod = MemoryFlushModifiedList;
-            NtSetSystemInformation(SystemMemoryListInformation, ref cmdMod, sizeof(int));
+            NtSetSystemInformation(SystemMemoryListInformation, &cmdMod, sizeof(int));
 
             int cmdWs = MemoryEmptyWorkingSets;
-            NtSetSystemInformation(SystemMemoryListInformation, ref cmdWs, sizeof(int));
+            NtSetSystemInformation(SystemMemoryListInformation, &cmdWs, sizeof(int));
+
             TrimUserProcessesWorkingSets();
         }
 
@@ -251,35 +237,65 @@ namespace RAMMapTray
         {
             try
             {
-                Process[] processes = Process.GetProcesses();
+                uint* pids = stackalloc uint[1024];
+                if (!K32EnumProcesses(pids, 1024 * sizeof(uint), out uint bytesReturned))
+                    return;
+
+                uint count = bytesReturned / sizeof(uint);
                 IntPtr negOne = new IntPtr(-1);
+                char* nameBuf = stackalloc char[260];
 
-                foreach (Process proc in processes)
+                for (uint i = 0; i < count; i++)
                 {
-                    try
-                    {
-                        if (proc.Id <= 4) continue;
-                        if (ExcludedProcesses.Contains(proc.ProcessName)) continue;
+                    uint pid = pids[i];
+                    if (pid <= 4) continue;
 
-                        IntPtr hProc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION, false, proc.Id);
-                        if (hProc != IntPtr.Zero)
+                    IntPtr hProc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION, false, (int)pid);
+                    if (hProc == IntPtr.Zero) continue;
+
+                    uint size = 260;
+                    if (QueryFullProcessImageNameW(hProc, 0, nameBuf, ref size) > 0)
+                    {
+                        if (!IsExcluded(nameBuf, size))
                         {
                             SetProcessWorkingSetSize(hProc, negOne, negOne);
-                            CloseHandle(hProc);
                         }
                     }
-                    catch
-                    {
-                    }
-                    finally
-                    {
-                        proc.Dispose();
-                    }
+                    CloseHandle(hProc);
                 }
             }
             catch
             {
             }
+        }
+
+        private static bool IsExcluded(char* path, uint length)
+        {
+            if (length == 0) return true;
+
+            int start = (int)length - 1;
+            while (start >= 0 && path[start] != '\\')
+            {
+                start--;
+            }
+            start++;
+            int nameLen = (int)length - start;
+            if (nameLen <= 0) return true;
+
+            ReadOnlySpan<char> span = new ReadOnlySpan<char>(path + start, nameLen);
+
+            return span.Equals("explorer.exe", StringComparison.OrdinalIgnoreCase) ||
+                   span.Equals("dwm.exe", StringComparison.OrdinalIgnoreCase) ||
+                   span.Equals("csrss.exe", StringComparison.OrdinalIgnoreCase) ||
+                   span.Equals("lsass.exe", StringComparison.OrdinalIgnoreCase) ||
+                   span.Equals("services.exe", StringComparison.OrdinalIgnoreCase) ||
+                   span.Equals("smss.exe", StringComparison.OrdinalIgnoreCase) ||
+                   span.Equals("winlogon.exe", StringComparison.OrdinalIgnoreCase) ||
+                   span.Equals("svchost.exe", StringComparison.OrdinalIgnoreCase) ||
+                   span.Equals("audiodg.exe", StringComparison.OrdinalIgnoreCase) ||
+                   span.Equals("RAMMapTray.exe", StringComparison.OrdinalIgnoreCase) ||
+                   span.Equals("taskhostw.exe", StringComparison.OrdinalIgnoreCase) ||
+                   span.Equals("sihost.exe", StringComparison.OrdinalIgnoreCase);
         }
     }
 }
