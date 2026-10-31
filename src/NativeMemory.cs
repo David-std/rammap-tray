@@ -62,19 +62,7 @@ namespace RAMMapTray
         private static extern bool GlobalMemoryStatusEx(ref MEMORYSTATUSEX lpBuffer);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool SetProcessWorkingSetSize(IntPtr hProcess, IntPtr dwMinimumWorkingSetSize, IntPtr dwMaximumWorkingSetSize);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr OpenProcess(uint processAccess, bool bInheritHandle, int processId);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr hObject);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool K32EnumProcesses(uint* pProcessIds, uint cb, out uint pBytesReturned);
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        private static extern uint QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, char* lpExeName, ref uint lpdwSize);
 
         [DllImport("ntdll.dll", SetLastError = true)]
         private static extern int NtSetSystemInformation(int SystemInformationClass, void* SystemInformation, int SystemInformationLength);
@@ -99,12 +87,8 @@ namespace RAMMapTray
 
         private const int SystemMemoryListInformation = 80;
         private const int MemoryEmptyWorkingSets = 2;
-        private const int MemoryFlushModifiedList = 3;
         private const int MemoryPurgeStandbyList = 4;
         private const int MemoryPurgeLowPriorityStandbyList = 8;
-
-        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
-        private const uint PROCESS_SET_QUOTA = 0x0100;
 
         private static bool _privilegesAcquired = false;
 
@@ -199,8 +183,6 @@ namespace RAMMapTray
 
             int cmd = MemoryEmptyWorkingSets;
             NtSetSystemInformation(SystemMemoryListInformation, &cmd, sizeof(int));
-
-            TrimUserProcessesWorkingSets();
         }
 
         public static void EmptyStandbyList()
@@ -224,78 +206,8 @@ namespace RAMMapTray
             int cmdSbLow = MemoryPurgeLowPriorityStandbyList;
             NtSetSystemInformation(SystemMemoryListInformation, &cmdSbLow, sizeof(int));
 
-            int cmdMod = MemoryFlushModifiedList;
-            NtSetSystemInformation(SystemMemoryListInformation, &cmdMod, sizeof(int));
-
             int cmdWs = MemoryEmptyWorkingSets;
             NtSetSystemInformation(SystemMemoryListInformation, &cmdWs, sizeof(int));
-
-            TrimUserProcessesWorkingSets();
-        }
-
-        private static void TrimUserProcessesWorkingSets()
-        {
-            try
-            {
-                uint* pids = stackalloc uint[1024];
-                if (!K32EnumProcesses(pids, 1024 * sizeof(uint), out uint bytesReturned))
-                    return;
-
-                uint count = bytesReturned / sizeof(uint);
-                IntPtr negOne = new IntPtr(-1);
-                char* nameBuf = stackalloc char[260];
-
-                for (uint i = 0; i < count; i++)
-                {
-                    uint pid = pids[i];
-                    if (pid <= 4) continue;
-
-                    IntPtr hProc = OpenProcess(PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION, false, (int)pid);
-                    if (hProc == IntPtr.Zero) continue;
-
-                    uint size = 260;
-                    if (QueryFullProcessImageNameW(hProc, 0, nameBuf, ref size) > 0)
-                    {
-                        if (!IsExcluded(nameBuf, size))
-                        {
-                            SetProcessWorkingSetSize(hProc, negOne, negOne);
-                        }
-                    }
-                    CloseHandle(hProc);
-                }
-            }
-            catch
-            {
-            }
-        }
-
-        private static bool IsExcluded(char* path, uint length)
-        {
-            if (length == 0) return true;
-
-            int start = (int)length - 1;
-            while (start >= 0 && path[start] != '\\')
-            {
-                start--;
-            }
-            start++;
-            int nameLen = (int)length - start;
-            if (nameLen <= 0) return true;
-
-            ReadOnlySpan<char> span = new ReadOnlySpan<char>(path + start, nameLen);
-
-            return span.Equals("explorer.exe", StringComparison.OrdinalIgnoreCase) ||
-                   span.Equals("dwm.exe", StringComparison.OrdinalIgnoreCase) ||
-                   span.Equals("csrss.exe", StringComparison.OrdinalIgnoreCase) ||
-                   span.Equals("lsass.exe", StringComparison.OrdinalIgnoreCase) ||
-                   span.Equals("services.exe", StringComparison.OrdinalIgnoreCase) ||
-                   span.Equals("smss.exe", StringComparison.OrdinalIgnoreCase) ||
-                   span.Equals("winlogon.exe", StringComparison.OrdinalIgnoreCase) ||
-                   span.Equals("svchost.exe", StringComparison.OrdinalIgnoreCase) ||
-                   span.Equals("audiodg.exe", StringComparison.OrdinalIgnoreCase) ||
-                   span.Equals("RAMMapTray.exe", StringComparison.OrdinalIgnoreCase) ||
-                   span.Equals("taskhostw.exe", StringComparison.OrdinalIgnoreCase) ||
-                   span.Equals("sihost.exe", StringComparison.OrdinalIgnoreCase);
         }
     }
 }

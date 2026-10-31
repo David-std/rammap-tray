@@ -1,6 +1,5 @@
 using System;
 using System.Diagnostics;
-using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows;
@@ -24,6 +23,15 @@ namespace RAMMapTray
 
         [DllImport("user32.dll")]
         private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool BringWindowToTop(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
@@ -49,16 +57,6 @@ namespace RAMMapTray
         }
 
         [StructLayout(LayoutKind.Sequential)]
-        private struct MSLLHOOKSTRUCT
-        {
-            public POINT pt;
-            public uint mouseData;
-            public uint flags;
-            public uint time;
-            public IntPtr dwExtraInfo;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
         private struct RECT
         {
             public int Left;
@@ -67,31 +65,19 @@ namespace RAMMapTray
             public int Bottom;
         }
 
-        private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelMouseProc lpfn, IntPtr hMod, uint dwThreadId);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
-
-        [DllImport("user32.dll")]
-        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
-
         [DllImport("user32.dll")]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
 
-        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
-        private static extern IntPtr GetModuleHandle(string? lpModuleName);
+        [DllImport("user32.dll")]
+        private static extern bool GetCursorPos(out POINT lpPoint);
 
-        private const int WH_MOUSE_LL = 14;
-        private const int WM_LBUTTONDOWN = 0x0201;
-        private const int WM_RBUTTONDOWN = 0x0204;
-        private const int WM_MBUTTONDOWN = 0x0207;
-        private const int WM_NCLBUTTONDOWN = 0x00A1;
-        private const int WM_NCRBUTTONDOWN = 0x00A4;
+        [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int vKey);
+
+        private const int VK_LBUTTON = 0x01;
+        private const int VK_RBUTTON = 0x02;
+        private const int VK_MBUTTON = 0x04;
 
         private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
         private const int GWL_EXSTYLE = -20;
@@ -113,12 +99,10 @@ namespace RAMMapTray
         private System.Windows.Threading.DispatcherTimer? _clipWatchTimer;
         private System.Windows.Threading.DispatcherTimer? _ramMapConfirmTimer;
         private System.Windows.Threading.DispatcherTimer? _inactivityTimer;
+        private System.Windows.Threading.DispatcherTimer? _outsideClickTimer;
         private DateTime _lastShowTime = DateTime.MinValue;
 
         public DateTime LastHideTime { get; private set; } = DateTime.MinValue;
-
-        private IntPtr _mouseHookHandle = IntPtr.Zero;
-        private LowLevelMouseProc? _mouseHookDelegate;
 
         private ulong _lastUsedBytes = ulong.MaxValue;
         private ulong _lastStandbyBytes = ulong.MaxValue;
@@ -132,13 +116,6 @@ namespace RAMMapTray
         {
             InitializeComponent();
             _onRAMMapLaunchRequest = onRAMMapLaunchRequest;
-            IsVisibleChanged += (s, e) =>
-            {
-                if (!(bool)e.NewValue)
-                {
-                    UninstallMouseHook();
-                }
-            };
         }
 
         protected override void OnSourceInitialized(EventArgs e)
@@ -210,85 +187,74 @@ namespace RAMMapTray
             _lastShowTime = DateTime.UtcNow;
             _isScreenClippingActive = false;
             this.Topmost = true;
-            InstallMouseHook();
             StartInactivityTimer();
-        }
+            StartOutsideClickTimer();
 
-        private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
-        {
-            if (nCode >= 0 && this.IsVisible)
-            {
-                int msg = wParam.ToInt32();
-                if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN ||
-                    msg == WM_NCLBUTTONDOWN || msg == WM_NCRBUTTONDOWN)
-                {
-                    unsafe
-                    {
-                        MSLLHOOKSTRUCT* hookStruct = (MSLLHOOKSTRUCT*)lParam;
-                        int x = hookStruct->pt.X;
-                        int y = hookStruct->pt.Y;
-
-                        IntPtr hWnd = new WindowInteropHelper(this).Handle;
-                        if (hWnd != IntPtr.Zero && GetWindowRect(hWnd, out RECT rc))
-                        {
-                            if (x < rc.Left || x > rc.Right || y < rc.Top || y > rc.Bottom)
-                            {
-                                if (!_isScreenClippingActive)
-                                {
-                                    if (Dispatcher.CheckAccess())
-                                    {
-                                        HandleDeactivation();
-                                    }
-                                    else
-                                    {
-                                        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Send, new Action(HandleDeactivation));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return CallNextHookEx(_mouseHookHandle, nCode, wParam, lParam);
-        }
-
-        private void InstallMouseHook()
-        {
-            if (_mouseHookHandle != IntPtr.Zero) return;
             try
             {
-                _mouseHookDelegate = MouseHookCallback;
-                IntPtr hMod = IntPtr.Zero;
-                using (var curProc = Process.GetCurrentProcess())
-                using (var curMod = curProc.MainModule)
+                var helper = new WindowInteropHelper(this);
+                if (helper.Handle != IntPtr.Zero)
                 {
-                    if (curMod != null)
-                    {
-                        hMod = GetModuleHandle(curMod.ModuleName);
-                    }
+                    ForceForeground(helper.Handle);
                 }
-                _mouseHookHandle = SetWindowsHookEx(WH_MOUSE_LL, _mouseHookDelegate, hMod, 0);
             }
             catch { }
         }
 
-        private void UninstallMouseHook()
+        private void StartOutsideClickTimer()
         {
-            if (_mouseHookHandle != IntPtr.Zero)
+            _outsideClickTimer?.Stop();
+            _outsideClickTimer = new System.Windows.Threading.DispatcherTimer(System.Windows.Threading.DispatcherPriority.Input)
             {
-                try
+                Interval = TimeSpan.FromMilliseconds(50)
+            };
+            _outsideClickTimer.Tick += (s, e) =>
+            {
+                if (!this.IsVisible || _isScreenClippingActive) return;
+
+                if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ||
+                    (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 ||
+                    (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0)
                 {
-                    UnhookWindowsHookEx(_mouseHookHandle);
+                    IntPtr hWnd = new WindowInteropHelper(this).Handle;
+                    if (hWnd != IntPtr.Zero && GetWindowRect(hWnd, out RECT rc))
+                    {
+                        GetCursorPos(out POINT pt);
+                        if (pt.X < rc.Left || pt.X > rc.Right || pt.Y < rc.Top || pt.Y > rc.Bottom)
+                        {
+                            HandleDeactivation();
+                        }
+                    }
                 }
-                catch { }
-                _mouseHookHandle = IntPtr.Zero;
-            }
+            };
+            _outsideClickTimer.Start();
         }
 
-        protected override void OnClosed(EventArgs e)
+        public static void ForceForeground(IntPtr hWnd)
         {
-            UninstallMouseHook();
-            base.OnClosed(e);
+            if (hWnd == IntPtr.Zero) return;
+            try
+            {
+                IntPtr fgWnd = GetForegroundWindow();
+                if (fgWnd == hWnd) return;
+
+                uint fgThread = fgWnd != IntPtr.Zero ? GetWindowThreadProcessId(fgWnd, out _) : 0;
+                uint curThread = GetCurrentThreadId();
+
+                if (fgThread != 0 && fgThread != curThread)
+                {
+                    AttachThreadInput(curThread, fgThread, true);
+                    SetForegroundWindow(hWnd);
+                    BringWindowToTop(hWnd);
+                    AttachThreadInput(curThread, fgThread, false);
+                }
+                else
+                {
+                    SetForegroundWindow(hWnd);
+                    BringWindowToTop(hWnd);
+                }
+            }
+            catch { }
         }
 
         public void StartInactivityTimer()
@@ -296,7 +262,7 @@ namespace RAMMapTray
             _inactivityTimer?.Stop();
             _inactivityTimer = new System.Windows.Threading.DispatcherTimer
             {
-                Interval = TimeSpan.FromSeconds(15)
+                Interval = TimeSpan.FromSeconds(7)
             };
             _inactivityTimer.Tick += (s, e) =>
             {
@@ -307,7 +273,7 @@ namespace RAMMapTray
                 }
                 else
                 {
-                    _inactivityTimer.Interval = TimeSpan.FromSeconds(5);
+                    _inactivityTimer.Interval = TimeSpan.FromSeconds(3);
                 }
             };
             _inactivityTimer.Start();
@@ -318,7 +284,7 @@ namespace RAMMapTray
             if (_inactivityTimer != null && _inactivityTimer.IsEnabled)
             {
                 _inactivityTimer.Stop();
-                _inactivityTimer.Interval = TimeSpan.FromSeconds(15);
+                _inactivityTimer.Interval = TimeSpan.FromSeconds(7);
                 _inactivityTimer.Start();
             }
         }
@@ -331,6 +297,12 @@ namespace RAMMapTray
         private void Window_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
         {
             ResetInactivityTimer();
+            if (e.Key == Key.Escape)
+            {
+                e.Handled = true;
+                HandleDeactivation();
+                return;
+            }
             CheckAndHandleScreenClip(e);
         }
 
@@ -491,8 +463,8 @@ namespace RAMMapTray
         {
             _clipWatchTimer?.Stop();
             _inactivityTimer?.Stop();
+            _outsideClickTimer?.Stop();
             ResetRAMMapButton();
-            UninstallMouseHook();
             LastHideTime = DateTime.UtcNow;
             this.Hide();
         }
@@ -543,8 +515,8 @@ namespace RAMMapTray
 
             LastHideTime = DateTime.UtcNow;
             _inactivityTimer?.Stop();
+            _outsideClickTimer?.Stop();
             ResetRAMMapButton();
-            UninstallMouseHook();
             this.Hide();
         }
 
@@ -580,13 +552,18 @@ namespace RAMMapTray
                 if (System.Windows.Application.Current is App app) app.RefreshMemoryNow();
 
                 button.Content = CreateSuccessContent(button.FontSize);
-                await Task.Delay(1500);
+                await Task.Delay(1200);
+
+                if (this.IsVisible && !_isScreenClippingActive)
+                {
+                    _ = ScheduleAutoHideAfterActionAsync();
+                }
             }
             catch
             {
                 dotsTimer.Stop();
                 button.Content = "Error";
-                await Task.Delay(1500);
+                await Task.Delay(1200);
             }
             finally
             {
@@ -594,6 +571,15 @@ namespace RAMMapTray
                 button.Content = originalText;
                 _isBusy = false;
                 ResetInactivityTimer();
+            }
+        }
+
+        private async Task ScheduleAutoHideAfterActionAsync()
+        {
+            await Task.Delay(1200);
+            if (this.IsVisible && !this.IsMouseOver && !_isBusy && !_isRamMapConfirming && !_isScreenClippingActive)
+            {
+                HandleDeactivation();
             }
         }
 

@@ -98,6 +98,15 @@ namespace RAMMapTray
             catch { }
 
             _trayManager = new TrayIconManager(
+                getOwnerHwnd: () =>
+                {
+                    if (_flyoutWindow != null)
+                    {
+                        var helper = new System.Windows.Interop.WindowInteropHelper(_flyoutWindow);
+                        return helper.Handle;
+                    }
+                    return IntPtr.Zero;
+                },
                 onToggleFlyout: ToggleFlyoutWindow,
                 onOpenRAMMap: LaunchRAMMapExecutable,
                 onPurgeAll: PurgeAllMemory,
@@ -116,6 +125,7 @@ namespace RAMMapTray
         }
 
         private bool _isRefreshing = false;
+        private bool _isToggling = false;
         private DateTime _lastToggleTime = DateTime.MinValue;
 
         private void Timer_Tick(object? sender, EventArgs e)
@@ -135,7 +145,8 @@ namespace RAMMapTray
 
             try
             {
-                MemoryStatusInfo memInfo = await Task.Run(() => NativeMemory.GetMemoryStatus());
+                // NativeMemory.GetMemoryStatus() runs in ~2 microseconds via kernel syscalls
+                MemoryStatusInfo memInfo = NativeMemory.GetMemoryStatus();
                 int pct = (int)Math.Round(memInfo.MemoryLoadPercentage);
                 double usedGB = memInfo.UsedMemoryBytes / (1024.0 * 1024 * 1024);
                 double totalGB = memInfo.TotalMemoryBytes / (1024.0 * 1024 * 1024);
@@ -159,36 +170,44 @@ namespace RAMMapTray
 
         private void ToggleFlyoutWindow()
         {
-            if (_flyoutWindow == null) return;
+            if (_flyoutWindow == null || _isToggling) return;
 
-            if ((DateTime.UtcNow - _lastToggleTime).TotalMilliseconds < 250 ||
-                (DateTime.UtcNow - _flyoutWindow.LastHideTime).TotalMilliseconds < 250)
+            DateTime now = DateTime.UtcNow;
+            if ((now - _lastToggleTime).TotalMilliseconds < 200 ||
+                (now - _flyoutWindow.LastHideTime).TotalMilliseconds < 200)
             {
                 return;
             }
-            _lastToggleTime = DateTime.UtcNow;
+            _lastToggleTime = now;
+            _isToggling = true;
 
-            if (_flyoutWindow.IsVisible)
+            try
             {
-                _flyoutWindow.Hide();
-            }
-            else
-            {
-                _flyoutWindow.PositionNearTray();
-                _flyoutWindow.Show();
-                _flyoutWindow.Activate();
-                try
+                if (_flyoutWindow.IsVisible)
                 {
-                    var helper = new System.Windows.Interop.WindowInteropHelper(_flyoutWindow);
-                    if (helper.Handle != IntPtr.Zero)
-                    {
-                        SetForegroundWindow(helper.Handle);
-                    }
+                    _flyoutWindow.Hide();
                 }
-                catch { }
-                _flyoutWindow.PositionNearTray();
-                _flyoutWindow.RecordShowTime();
-                RefreshMemoryNow();
+                else
+                {
+                    // Instant synchronous memory metrics update BEFORE showing so metrics appear immediately
+                    try
+                    {
+                        MemoryStatusInfo currentMem = NativeMemory.GetMemoryStatus();
+                        _flyoutWindow.UpdateMetrics(currentMem);
+                    }
+                    catch { }
+
+                    _flyoutWindow.PositionNearTray();
+                    _flyoutWindow.Show();
+                    _flyoutWindow.Activate();
+                    _flyoutWindow.RecordShowTime();
+                    _flyoutWindow.PositionNearTray();
+                    RefreshMemoryNow();
+                }
+            }
+            finally
+            {
+                _isToggling = false;
             }
         }
 
@@ -197,7 +216,7 @@ namespace RAMMapTray
             Task.Run(() =>
             {
                 NativeMemory.PurgeAll();
-                Dispatcher.Invoke(RefreshMemoryNow);
+                Dispatcher.BeginInvoke(RefreshMemoryNow);
             });
         }
 
@@ -206,7 +225,7 @@ namespace RAMMapTray
             Task.Run(() =>
             {
                 NativeMemory.EmptyWorkingSets();
-                Dispatcher.Invoke(RefreshMemoryNow);
+                Dispatcher.BeginInvoke(RefreshMemoryNow);
             });
         }
 
@@ -215,7 +234,7 @@ namespace RAMMapTray
             Task.Run(() =>
             {
                 NativeMemory.EmptyStandbyList();
-                Dispatcher.Invoke(RefreshMemoryNow);
+                Dispatcher.BeginInvoke(RefreshMemoryNow);
             });
         }
 

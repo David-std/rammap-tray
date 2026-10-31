@@ -1,8 +1,6 @@
 using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
-using System.Drawing.Text;
-using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 using Microsoft.Win32;
@@ -11,12 +9,61 @@ namespace RAMMapTray
 {
     public class TrayIconManager : IDisposable
     {
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool DestroyIcon(IntPtr hIcon);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr CreatePopupMenu();
+
+        [DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool AppendMenuW(IntPtr hMenu, uint uFlags, UIntPtr uIDNewItem, string lpNewItem);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool DestroyMenu(IntPtr hMenu);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern int TrackPopupMenuEx(IntPtr hMenu, uint uFlags, int x, int y, IntPtr hWnd, IntPtr lpTPMParams);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetMenuDefaultItem(IntPtr hMenu, uint uItem, uint fByPos);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetCursorPos(out POINT lpPoint);
+
+        [DllImport("uxtheme.dll", EntryPoint = "#135", SetLastError = true)]
+        private static extern int SetPreferredAppMode(int appMode);
+
+        private const uint MF_STRING = 0x00000000;
+        private const uint MF_SEPARATOR = 0x00000800;
+        private const uint MF_CHECKED = 0x00000008;
+        private const uint MF_UNCHECKED = 0x00000000;
+
+        private const uint TPM_RETURNCMD = 0x0100;
+        private const uint TPM_RIGHTBUTTON = 0x0002;
+        private const uint TPM_NONOTIFY = 0x0080;
+        private const uint WM_NULL = 0x0000;
+
+        private const uint CMD_OPEN_FLYOUT = 1001;
+        private const uint CMD_OPTIMIZE = 1002;
+        private const uint CMD_OPEN_RAMMAP = 1003;
+        private const uint CMD_AUTO_START = 1004;
+        private const uint CMD_EXIT = 1005;
+
         private readonly NotifyIcon _notifyIcon;
-        private readonly ContextMenuStrip _contextMenu;
-        private readonly ToolStripMenuItem _autoStartMenuItem;
+        private readonly Func<IntPtr> _getOwnerHwnd;
         private readonly Action _onToggleFlyout;
         private readonly Action _onOpenRAMMap;
         private readonly Action _onPurgeAll;
@@ -24,61 +71,25 @@ namespace RAMMapTray
         private readonly Action _onPurgeStandby;
         private int _lastPercentage = -1;
         private const string REG_APP_NAME = "RAMMapTrayCompanion";
+        private const string TASK_NAME = "RAMMapTrayCompanion";
 
         public TrayIconManager(
+            Func<IntPtr> getOwnerHwnd,
             Action onToggleFlyout, 
             Action onOpenRAMMap, 
             Action onPurgeAll,
             Action onPurgeWorkingSets,
             Action onPurgeStandby)
         {
+            _getOwnerHwnd = getOwnerHwnd;
             _onToggleFlyout = onToggleFlyout;
             _onOpenRAMMap = onOpenRAMMap;
             _onPurgeAll = onPurgeAll;
             _onPurgeWorkingSets = onPurgeWorkingSets;
             _onPurgeStandby = onPurgeStandby;
 
-            _contextMenu = new ContextMenuStrip();
-            _contextMenu.ShowImageMargin = true;
-            _contextMenu.ShowCheckMargin = false;
-            _contextMenu.Renderer = new DarkMenuRenderer();
-            _contextMenu.Padding = new Padding(0, 4, 0, 4);
-
-            var showItem = new ToolStripMenuItem("Abrir panel");
-            showItem.Font = new Font("Segoe UI Variable Text", 9f, FontStyle.Bold);
-            showItem.Click += (s, e) => _onToggleFlyout?.Invoke();
-            _contextMenu.Items.Add(showItem);
-
-            _contextMenu.Items.Add(new ToolStripSeparator());
-
-            var purgeAllItem = new ToolStripMenuItem("Optimizar memoria");
-            purgeAllItem.Font = new Font("Segoe UI Variable Text", 9f);
-            purgeAllItem.Click += (s, e) => _onPurgeAll?.Invoke();
-            _contextMenu.Items.Add(purgeAllItem);
-
-            var openRamMapItem = new ToolStripMenuItem("Abrir RAMMap");
-            openRamMapItem.Font = new Font("Segoe UI Variable Text", 9f);
-            openRamMapItem.Click += (s, e) => _onOpenRAMMap?.Invoke();
-            _contextMenu.Items.Add(openRamMapItem);
-
-            _contextMenu.Items.Add(new ToolStripSeparator());
-
-            _autoStartMenuItem = new ToolStripMenuItem("Iniciar con Windows");
-            _autoStartMenuItem.Font = new Font("Segoe UI Variable Text", 9f);
-            _autoStartMenuItem.Click += (s, e) => ToggleAutoStart();
-            UpdateAutoStartIcon();
-            _contextMenu.Items.Add(_autoStartMenuItem);
-
-            _contextMenu.Items.Add(new ToolStripSeparator());
-
-            var exitItem = new ToolStripMenuItem("Salir");
-            exitItem.Font = new Font("Segoe UI Variable Text", 9f);
-            exitItem.Click += (s, e) => System.Windows.Application.Current.Shutdown();
-            _contextMenu.Items.Add(exitItem);
-
             _notifyIcon = new NotifyIcon
             {
-                ContextMenuStrip = _contextMenu,
                 Text = "RAM"
             };
 
@@ -87,17 +98,93 @@ namespace RAMMapTray
             {
                 if (e.Button == MouseButtons.Left)
                 {
-                    if ((DateTime.UtcNow - lastClickTime).TotalMilliseconds < 250)
+                    if ((DateTime.UtcNow - lastClickTime).TotalMilliseconds < 200)
                     {
                         return;
                     }
                     lastClickTime = DateTime.UtcNow;
                     _onToggleFlyout?.Invoke();
                 }
+                else if (e.Button == MouseButtons.Right)
+                {
+                    ShowNativeContextMenu();
+                }
             };
 
             UpdateIcon(50, "RAM: 50%");
             _notifyIcon.Visible = true;
+        }
+
+        private void ShowNativeContextMenu()
+        {
+            try
+            {
+                // Force dark mode for Win32 popup menus
+                try { SetPreferredAppMode(2); } catch { }
+
+                IntPtr hMenu = CreatePopupMenu();
+                if (hMenu == IntPtr.Zero) return;
+
+                try
+                {
+                    AppendMenuW(hMenu, MF_STRING, (UIntPtr)CMD_OPEN_FLYOUT, "Abrir panel");
+                    SetMenuDefaultItem(hMenu, CMD_OPEN_FLYOUT, 0);
+
+                    AppendMenuW(hMenu, MF_SEPARATOR, UIntPtr.Zero, string.Empty);
+
+                    AppendMenuW(hMenu, MF_STRING, (UIntPtr)CMD_OPTIMIZE, "Optimizar memoria");
+                    AppendMenuW(hMenu, MF_STRING, (UIntPtr)CMD_OPEN_RAMMAP, "Abrir RAMMap");
+
+                    AppendMenuW(hMenu, MF_SEPARATOR, UIntPtr.Zero, string.Empty);
+
+                    bool autoStart = IsAutoStartEnabled();
+                    uint checkFlag = autoStart ? MF_CHECKED : MF_UNCHECKED;
+                    AppendMenuW(hMenu, MF_STRING | checkFlag, (UIntPtr)CMD_AUTO_START, "Iniciar con Windows");
+
+                    AppendMenuW(hMenu, MF_SEPARATOR, UIntPtr.Zero, string.Empty);
+
+                    AppendMenuW(hMenu, MF_STRING, (UIntPtr)CMD_EXIT, "Salir");
+
+                    GetCursorPos(out POINT pt);
+
+                    IntPtr ownerHwnd = _getOwnerHwnd();
+                    if (ownerHwnd != IntPtr.Zero)
+                    {
+                        SetForegroundWindow(ownerHwnd);
+                    }
+
+                    int cmd = TrackPopupMenuEx(hMenu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.X, pt.Y, ownerHwnd, IntPtr.Zero);
+
+                    if (ownerHwnd != IntPtr.Zero)
+                    {
+                        PostMessage(ownerHwnd, WM_NULL, IntPtr.Zero, IntPtr.Zero);
+                    }
+
+                    switch (cmd)
+                    {
+                        case (int)CMD_OPEN_FLYOUT:
+                            _onToggleFlyout?.Invoke();
+                            break;
+                        case (int)CMD_OPTIMIZE:
+                            _onPurgeAll?.Invoke();
+                            break;
+                        case (int)CMD_OPEN_RAMMAP:
+                            _onOpenRAMMap?.Invoke();
+                            break;
+                        case (int)CMD_AUTO_START:
+                            ToggleAutoStart();
+                            break;
+                        case (int)CMD_EXIT:
+                            System.Windows.Application.Current.Shutdown();
+                            break;
+                    }
+                }
+                finally
+                {
+                    DestroyMenu(hMenu);
+                }
+            }
+            catch { }
         }
 
         private static readonly Icon?[] _iconCache = new Icon?[101];
@@ -107,7 +194,10 @@ namespace RAMMapTray
             try
             {
                 string safeTooltip = tooltipText.Length > 63 ? tooltipText.Substring(0, 63) : tooltipText;
-                _notifyIcon.Text = safeTooltip;
+                if (_notifyIcon.Text != safeTooltip)
+                {
+                    _notifyIcon.Text = safeTooltip;
+                }
 
                 if (ramPercentage == _lastPercentage && _notifyIcon.Icon != null)
                 {
@@ -236,8 +326,6 @@ namespace RAMMapTray
             return path;
         }
 
-        private const string TASK_NAME = "RAMMapTrayCompanion";
-
         public bool IsAutoStartEnabled()
         {
             try
@@ -259,13 +347,6 @@ namespace RAMMapTray
             catch { }
 
             return false;
-        }
-
-        private void UpdateAutoStartIcon()
-        {
-            _autoStartMenuItem.Image = IsAutoStartEnabled()
-                ? RenderIcon("\uE73E", Color.White)
-                : null;
         }
 
         public void ToggleAutoStart()
@@ -324,32 +405,11 @@ namespace RAMMapTray
                         }
                     }
                 }
-
-                UpdateAutoStartIcon();
             }
             catch (Exception ex)
             {
                 MessageBox.Show($"Error al cambiar inicio automático: {ex.Message}", "RAMMap", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
-        }
-
-        private static Bitmap RenderIcon(string glyph, Color color, int size = 16)
-        {
-            Bitmap bmp = new Bitmap(size, size);
-            using (Graphics g = Graphics.FromImage(bmp))
-            {
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-                g.Clear(Color.Transparent);
-
-                using (Font f = new Font("Segoe MDL2 Assets", 10f, FontStyle.Regular, GraphicsUnit.Point))
-                using (SolidBrush b = new SolidBrush(color))
-                {
-                    var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
-                    g.DrawString(glyph, f, b, new RectangleF(0, 0, size, size), sf);
-                }
-            }
-            return bmp;
         }
 
         public void Dispose()
@@ -359,7 +419,6 @@ namespace RAMMapTray
                 _notifyIcon.Visible = false;
                 _notifyIcon.Icon?.Dispose();
                 _notifyIcon.Dispose();
-                _contextMenu?.Dispose();
                 for (int i = 0; i < _iconCache.Length; i++)
                 {
                     _iconCache[i]?.Dispose();
@@ -369,89 +428,6 @@ namespace RAMMapTray
             catch
             {
             }
-        }
-    }
-
-    /// <summary>Custom dark renderer for ContextMenuStrip to match WinUI 3 dark flyout style.</summary>
-    internal class DarkMenuRenderer : ToolStripProfessionalRenderer
-    {
-        private static readonly Color BgColor = Color.FromArgb(44, 44, 44);
-        private static readonly Color BorderColor = Color.FromArgb(56, 56, 56);
-        private static readonly Color HoverColor = Color.FromArgb(62, 62, 62);
-        private static readonly Color SepColor = Color.FromArgb(56, 56, 56);
-        private static readonly Color TextColor = Color.FromArgb(235, 235, 235);
-
-        public DarkMenuRenderer() : base(new DarkColorTable()) { }
-
-        protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
-        {
-            using (SolidBrush b = new SolidBrush(BgColor))
-                e.Graphics.FillRectangle(b, e.AffectedBounds);
-        }
-
-        protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
-        {
-            using (Pen p = new Pen(BorderColor))
-                e.Graphics.DrawRectangle(p, 0, 0, e.AffectedBounds.Width - 1, e.AffectedBounds.Height - 1);
-        }
-
-        protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
-        {
-            if (e.Item.Selected || e.Item.Pressed)
-            {
-                var rect = new Rectangle(4, 1, e.Item.Width - 8, e.Item.Height - 2);
-                using (SolidBrush b = new SolidBrush(HoverColor))
-                {
-                    e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-                    using (var path = RoundedRect(rect, 4))
-                        e.Graphics.FillPath(b, path);
-                }
-            }
-        }
-
-        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
-        {
-            e.TextColor = TextColor;
-            base.OnRenderItemText(e);
-        }
-
-        protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
-        {
-            int y = e.Item.Height / 2;
-            using (Pen p = new Pen(SepColor))
-                e.Graphics.DrawLine(p, 8, y, e.Item.Width - 8, y);
-        }
-
-        protected override void OnRenderImageMargin(ToolStripRenderEventArgs e)
-        {
-            // No background for image column
-        }
-
-        private static GraphicsPath RoundedRect(Rectangle bounds, int radius)
-        {
-            int diameter = radius * 2;
-            GraphicsPath path = new GraphicsPath();
-            path.AddArc(bounds.X, bounds.Y, diameter, diameter, 180, 90);
-            path.AddArc(bounds.Right - diameter, bounds.Y, diameter, diameter, 270, 90);
-            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
-            path.AddArc(bounds.X, bounds.Bottom - diameter, diameter, diameter, 90, 90);
-            path.CloseFigure();
-            return path;
-        }
-
-        private class DarkColorTable : ProfessionalColorTable
-        {
-            public override Color MenuBorder => BorderColor;
-            public override Color MenuItemBorder => Color.Transparent;
-            public override Color MenuItemSelected => HoverColor;
-            public override Color MenuStripGradientBegin => BgColor;
-            public override Color MenuStripGradientEnd => BgColor;
-            public override Color ToolStripDropDownBackground => BgColor;
-            public override Color ImageMarginGradientBegin => BgColor;
-            public override Color ImageMarginGradientMiddle => BgColor;
-            public override Color ImageMarginGradientEnd => BgColor;
-            public override Color SeparatorDark => SepColor;
-            public override Color SeparatorLight => Color.Transparent;
         }
     }
 }
